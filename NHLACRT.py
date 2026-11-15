@@ -1,297 +1,226 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 6,
-   "id": "2b9aefc5-9c2e-470c-985b-490e85908cb3",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "🤖 Running scheduled CRT Master scan...\n",
-      "[2026-11-14 21:44:10] Starting CRT Master scan...\n",
-      "Scanning US30...\n",
-      "Scanning Nasdaq...\n",
-      "Scanning Gold...\n",
-      "Scanning US500...\n",
-      "Scanning USDJPY...\n",
-      "Scanning USDCAD...\n",
-      "Scanning GBPUSD...\n",
-      "Scanning EURUSD...\n",
-      "Scanning BTCUSD...\n",
-      "Scanning ETHUSD...\n",
-      "Scanning UK100...\n",
-      "--> Message successfully sent to Telegram!\n",
-      "--> No signals found. Heartbeat message processed.\n",
-      "Scan complete. Exiting.\n"
-     ]
-    }
-   ],
-   "source": [
-    "import yfinance as yf\n",
-    "import pandas as pd\n",
-    "import numpy as np\n",
-    "import asyncio\n",
-    "import os\n",
-    "import nest_asyncio\n",
-    "from telegram import Bot\n",
-    "from datetime import datetime\n",
-    "\n",
-    "nest_asyncio.apply()\n",
-    "\n",
-    "# ===== 1. CONFIGURATION =====\n",
-    "# For Jupyter testing, uncomment the line below and paste your token.\n",
-    "# For GitHub, keep it commented out so it uses the GitHub Secret.\n",
-    "TG_TOKEN = os.getenv(\"TG_TOKEN\") \n",
-    "TG_TOKEN = \"9194896928:AAEonjaja5NDtN0a5OYPLwAODPJPacLlknk\" # <--- Uncomment for Jupyter test\n",
-    "\n",
-    "CHAT_ID = \"7053671715\"                \n",
-    "\n",
-    "INSTRUMENTS = {\n",
-    "    # US Indices & Commodities\n",
-    "    \"^DJI\":     \"US30\",\n",
-    "    \"^IXIC\":    \"Nasdaq\",\n",
-    "    \"GC=F\":     \"Gold\",\n",
-    "    \"^GSPC\":    \"US500\",\n",
-    "    \n",
-    "    # Forex\n",
-    "    \"USDJPY=X\": \"USDJPY\",\n",
-    "    \"USDCAD=X\": \"USDCAD\",\n",
-    "    \"GBPUSD=X\": \"GBPUSD\",\n",
-    "    \"EURUSD=X\": \"EURUSD\",\n",
-    "    \n",
-    "    # Crypto\n",
-    "    \"BTC-USD\":  \"BTCUSD\",\n",
-    "    \"ETH-USD\":  \"ETHUSD\",\n",
-    "    \n",
-    "    # UK Index\n",
-    "    \"^FTSE\":    \"UK100\"\n",
-    "}\n",
-    "\n",
-    "TIMEFRAME = \"4h\" # CRT Reference Timeframe\n",
-    "ENTRY_TF = \"1h\"\n",
-    "\n",
-    "# ===== 2. DATA FETCHING & CALCULATIONS =====\n",
-    "def fetch_ohlc(symbol, interval, period):\n",
-    "    try:\n",
-    "        df = yf.download(symbol, interval=interval, period=period, progress=False)\n",
-    "        if df.empty:\n",
-    "            return None\n",
-    "        \n",
-    "        # Handle yfinance's multi-index columns\n",
-    "        if isinstance(df.columns, pd.MultiIndex):\n",
-    "            df.columns = df.columns.get_level_values(0)\n",
-    "            \n",
-    "        df = df[[\"Open\", \"High\", \"Low\", \"Close\"]].copy()\n",
-    "        df.columns = [\"open\", \"high\", \"low\", \"close\"]\n",
-    "        \n",
-    "        # Calculate ATR (14) for Order Block displacement\n",
-    "        df['tr'] = np.maximum(df['high'] - df['low'], \n",
-    "                              np.maximum(abs(df['high'] - df['close'].shift(1)), \n",
-    "                                         abs(df['low'] - df['close'].shift(1))))\n",
-    "        df['atr'] = df['tr'].rolling(window=14).mean()\n",
-    "        \n",
-    "        return df\n",
-    "    except Exception as e:\n",
-    "        print(f\"Error fetching {symbol} {interval}: {e}\")\n",
-    "        return None\n",
-    "\n",
-    "# ===== 3. FVG & OB DETECTION =====\n",
-    "def check_recent_fvg(df, is_bull):\n",
-    "    lookback = min(10, len(df) - 3)\n",
-    "    for i in range(1, lookback):\n",
-    "        idx = -i\n",
-    "        if is_bull:\n",
-    "            if df['low'].iloc[idx] > df['high'].iloc[idx-2]:\n",
-    "                return True\n",
-    "        else:\n",
-    "            if df['high'].iloc[idx] < df['low'].iloc[idx-2]:\n",
-    "                return True\n",
-    "    return False\n",
-    "\n",
-    "def has_recent_ob(df, is_bull):\n",
-    "    lookback = 3\n",
-    "    if len(df) < lookback + 5:\n",
-    "        return False\n",
-    "        \n",
-    "    for i in range(1, lookback + 1):\n",
-    "        idx = -i\n",
-    "        candle = df.iloc[idx]\n",
-    "        body_size = abs(candle['close'] - candle['open'])\n",
-    "        \n",
-    "        if body_size > candle['atr'] * 1.5:\n",
-    "            if is_bull and candle['close'] > candle['open']:\n",
-    "                recent_high = df['high'].iloc[idx-5:idx].max()\n",
-    "                if candle['close'] > recent_high:\n",
-    "                    return True\n",
-    "            elif not is_bull and candle['close'] < candle['open']:\n",
-    "                recent_low = df['low'].iloc[idx-5:idx].min()\n",
-    "                if candle['close'] < recent_low:\n",
-    "                    return True\n",
-    "    return False\n",
-    "\n",
-    "# ===== 4. CRT MODEL LOGIC =====\n",
-    "def check_crt_signals(df):\n",
-    "    if df is None or len(df) < 20:\n",
-    "        return None\n",
-    "\n",
-    "    c1 = df.iloc[-2]\n",
-    "    c2 = df.iloc[-1]\n",
-    "    \n",
-    "    c1_high, c1_low = c1['high'], c1['low']\n",
-    "    c1_eq = (c1_high + c1_low) / 2\n",
-    "    current_close = c2['close']\n",
-    "    buf = 0.0 \n",
-    "\n",
-    "    recent_bull_fvg = check_recent_fvg(df, True)\n",
-    "    recent_bear_fvg = check_recent_fvg(df, False)\n",
-    "    has_bull_ob = has_recent_ob(df, True)\n",
-    "    has_bear_ob = has_recent_ob(df, False)\n",
-    "\n",
-    "    m1_sell = c2['high'] > c1_high + buf and c2['close'] < c1_high and (recent_bear_fvg or has_bear_ob)\n",
-    "    m1_buy = c2['low'] < c1_low - buf and c2['close'] > c1_low and (recent_bull_fvg or has_bull_ob)\n",
-    "\n",
-    "    m2_buy = False\n",
-    "    m2_sell = False\n",
-    "    prev_candle = df.iloc[-2]\n",
-    "    curr_candle = df.iloc[-1]\n",
-    "    \n",
-    "    if prev_candle['close'] > c1_high and curr_candle['low'] <= c1_high and curr_candle['close'] > c1_high and curr_candle['close'] > curr_candle['open']:\n",
-    "         m2_buy = (recent_bull_fvg or has_bull_ob)\n",
-    "    if prev_candle['close'] < c1_low and curr_candle['high'] >= c1_low and curr_candle['close'] < c1_low and curr_candle['close'] < curr_candle['open']:\n",
-    "         m2_sell = (recent_bear_fvg or has_bear_ob)\n",
-    "\n",
-    "    bull_score = 0\n",
-    "    if c2['low'] < c1_low: bull_score += 1\n",
-    "    if recent_bull_fvg: bull_score += 1\n",
-    "    if has_bull_ob: bull_score += 1\n",
-    "    if current_close < c1_eq: bull_score += 1 \n",
-    "    if m1_buy or m2_buy: bull_score += 1\n",
-    "\n",
-    "    bear_score = 0\n",
-    "    if c2['high'] > c1_high: bear_score += 1\n",
-    "    if recent_bear_fvg: bear_score += 1\n",
-    "    if has_bear_ob: bear_score += 1\n",
-    "    if current_close > c1_eq: bear_score += 1 \n",
-    "    if m1_sell or m2_sell: bear_score += 1\n",
-    "\n",
-    "    signal = None\n",
-    "    if m1_buy:\n",
-    "        signal = {\"dir\": \"BULLISH\", \"model\": \"Model 1 (Sweep & Close)\", \"score\": bull_score, \"eq\": c1_eq}\n",
-    "    elif m1_sell:\n",
-    "        signal = {\"dir\": \"BEARISH\", \"model\": \"Model 1 (Sweep & Close)\", \"score\": bear_score, \"eq\": c1_eq}\n",
-    "    elif m2_buy:\n",
-    "        signal = {\"dir\": \"BULLISH\", \"model\": \"Model 2 (MSS & Retest)\", \"score\": bull_score, \"eq\": c1_eq}\n",
-    "    elif m2_sell:\n",
-    "        signal = {\"dir\": \"BEARISH\", \"model\": \"Model 2 (MSS & Retest)\", \"score\": bear_score, \"eq\": c1_eq}\n",
-    "\n",
-    "    return signal\n",
-    "\n",
-    "# ===== 5. ASYNC SCANNER & TELEGRAM (WITH AUTO-RETRY) =====\n",
-    "async def send_telegram_message(msg):\n",
-    "    if not TG_TOKEN:\n",
-    "        print(\"ERROR: TG_TOKEN is missing! Did you set it in GitHub Secrets?\")\n",
-    "        return\n",
-    "        \n",
-    "    bot = Bot(token=TG_TOKEN)\n",
-    "    \n",
-    "    # Try sending the message up to 3 times if it times out\n",
-    "    for attempt in range(3):\n",
-    "        try:\n",
-    "            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=\"Markdown\")\n",
-    "            print(\"--> Message successfully sent to Telegram!\")\n",
-    "            return # Exit function if successful\n",
-    "        except Exception as e:\n",
-    "            print(f\"Telegram attempt {attempt + 1} failed: {e}\")\n",
-    "            if attempt < 2:\n",
-    "                await asyncio.sleep(3) # Wait 3 seconds before retrying\n",
-    "            else:\n",
-    "                print(\"--> Failed to send message after 3 attempts.\")\n",
-    "\n",
-    "async def run_scan():\n",
-    "    print(f\"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting CRT Master scan...\")\n",
-    "    alerts = []\n",
-    "\n",
-    "    for symbol, name in INSTRUMENTS.items():\n",
-    "        print(f\"Scanning {name}...\")\n",
-    "        df = fetch_ohlc(symbol, TIMEFRAME, \"60d\")\n",
-    "        \n",
-    "        if df is None:\n",
-    "            continue\n",
-    "            \n",
-    "        signal = check_crt_signals(df)\n",
-    "        \n",
-    "        if signal:\n",
-    "            if signal['score'] >= 3:\n",
-    "                alerts.append({\n",
-    "                    \"instrument\": name,\n",
-    "                    \"direction\": signal['dir'],\n",
-    "                    \"model\": signal['model'],\n",
-    "                    \"score\": signal['score'],\n",
-    "                    \"price\": df.iloc[-1]['close'],\n",
-    "                    \"eq\": signal['eq']\n",
-    "                })\n",
-    "\n",
-    "    if alerts:\n",
-    "        msg = \"🚨 *CRT MASTER SIGNAL* 🚨\\n\\n\"\n",
-    "        for a in alerts:\n",
-    "            msg += (\n",
-    "                f\"*{a['instrument']}* | {a['direction']}\\n\"\n",
-    "                f\"Price: `{a['price']:.4f}` | EQ: `{a['eq']:.4f}`\\n\"\n",
-    "                f\"Confluence Score: *{a['score']}/5*\\n\"\n",
-    "                f\"Trigger: {a['model']}\\n\\n\"\n",
-    "            )\n",
-    "        await send_telegram_message(msg)\n",
-    "        print(f\"--> Found {len(alerts)} high-probability signal(s). Sent to Telegram!\")\n",
-    "    else:\n",
-    "        # Send a \"No Signal\" heartbeat message\n",
-    "        msg = (\n",
-    "            \"🔍 *CRT Master Scanner Update*\\n\\n\"\n",
-    "            \"No valid high-confluence signals detected on the 4H timeframe.\\n\\n\"\n",
-    "            f\"*Scanned:* US30, Nasdaq, Gold, US500, USDJPY, USDCAD, GBPUSD, EURUSD, BTCUSD, ETHUSD, UK100\\n\"\n",
-    "            f\"*Time:* {datetime.now().strftime('%H:%M')} UTC\\n\\n\"\n",
-    "            \"Waiting for the next 4H candle close.\"\n",
-    "        )\n",
-    "        await send_telegram_message(msg)\n",
-    "        print(\"--> No signals found. Heartbeat message processed.\")\n",
-    "\n",
-    "# ===== 6. EXECUTION =====\n",
-    "if __name__ == \"__main__\":\n",
-    "    print(\"🤖 Running scheduled CRT Master scan...\")\n",
-    "    asyncio.run(run_scan())\n",
-    "    print(\"Scan complete. Exiting.\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "f16471a2-879b-43b2-a063-17d52e162285",
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python [conda env:base] *",
-   "language": "python",
-   "name": "conda-base-py"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.13.9"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import asyncio
+import os
+import nest_asyncio
+from telegram import Bot
+from datetime import datetime
+
+nest_asyncio.apply()
+
+# ===== 1. CONFIGURATION =====
+TG_TOKEN = os.getenv("TG_TOKEN") 
+CHAT_ID = "7053671715"                
+
+INSTRUMENTS = {
+    "^DJI":     "US30",
+    "^IXIC":    "Nasdaq",
+    "GC=F":     "Gold",
+    "^GSPC":    "US500",
+    "USDJPY=X": "USDJPY",
+    "USDCAD=X": "USDCAD",
+    "GBPUSD=X": "GBPUSD",
+    "EURUSD=X": "EURUSD",
+    "BTC-USD":  "BTCUSD",
+    "ETH-USD":  "ETHUSD",
+    "^FTSE":    "UK100"
 }
+
+TIMEFRAME = "4h"      # CRT Reference Timeframe
+ENTRY_TF = "15m"      # <--- UPDATED TO 15 MINUTES
+
+# ===== 2. DATA FETCHING & CALCULATIONS =====
+def fetch_ohlc(symbol, interval, period):
+    try:
+        # Note: We only pull 5 days for 15m data to avoid rate limits
+        df = yf.download(symbol, interval=interval, period=period, progress=False)
+        if df.empty:
+            return None
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        df = df[["Open", "High", "Low", "Close"]].copy()
+        df.columns = ["open", "high", "low", "close"]
+        
+        # Calculate ATR for OB
+        df['tr'] = np.maximum(df['high'] - df['low'], 
+                              np.maximum(abs(df['high'] - df['close'].shift(1)), 
+                                         abs(df['low'] - df['close'].shift(1))))
+        df['atr'] = df['tr'].rolling(window=14).mean()
+        
+        return df
+    except Exception as e:
+        print(f"Error fetching {symbol} {interval}: {e}")
+        return None
+
+# ===== 3. FVG & OB DETECTION (On 15m) =====
+def check_recent_fvg(df, is_bull):
+    lookback = min(10, len(df) - 3)
+    for i in range(1, lookback):
+        idx = -i
+        if is_bull:
+            if df['low'].iloc[idx] > df['high'].iloc[idx-2]:
+                return True
+        else:
+            if df['high'].iloc[idx] < df['low'].iloc[idx-2]:
+                return True
+    return False
+
+def has_recent_ob(df, is_bull):
+    lookback = 3
+    if len(df) < lookback + 5:
+        return False
+        
+    for i in range(1, lookback + 1):
+        idx = -i
+        candle = df.iloc[idx]
+        body_size = abs(candle['close'] - candle['open'])
+        
+        if body_size > candle['atr'] * 1.5:
+            if is_bull and candle['close'] > candle['open']:
+                recent_high = df['high'].iloc[idx-5:idx].max()
+                if candle['close'] > recent_high:
+                    return True
+            elif not is_bull and candle['close'] < candle['open']:
+                recent_low = df['low'].iloc[idx-5:idx].min()
+                if candle['close'] < recent_low:
+                    return True
+    return False
+
+# ===== 4. MODEL LOGIC =====
+def check_crt_signals(df_4h, df_15m):
+    if df_4h is None or len(df_4h) < 3 or df_15m is None or len(df_15m) < 10:
+        return None
+
+    # 1. Get CRT Level from 4H
+    c1 = df_4h.iloc[-2]
+    c1_high, c1_low = c1['high'], c1['low']
+    c1_eq = (c1_high + c1_low) / 2
+
+    # 2. Check 15m data for sweep & entry
+    prev_candle = df_15m.iloc[-2]
+    curr_candle = df_15m.iloc[-1]
+    current_close = curr_candle['close']
+
+    recent_bull_fvg = check_recent_fvg(df_15m, True)
+    recent_bear_fvg = check_recent_fvg(df_15m, False)
+    has_bull_ob = has_recent_ob(df_15m, True)
+    has_bear_ob = has_recent_ob(df_15m, False)
+
+    # --- MODEL 1 (15m Sweep & Close) ---
+    m1_sell = curr_candle['high'] > c1_high and curr_candle['close'] < c1_high and (recent_bear_fvg or has_bear_ob)
+    m1_buy = curr_candle['low'] < c1_low and curr_candle['close'] > c1_low and (recent_bull_fvg or has_bull_ob)
+
+    # --- MODEL 2 (15m Breakout & Retest) ---
+    m2_buy = False
+    m2_sell = False
+    
+    if prev_candle['close'] > c1_high and curr_candle['low'] <= c1_high and curr_candle['close'] > c1_high and curr_candle['close'] > curr_candle['open']:
+         m2_buy = (recent_bull_fvg or has_bull_ob)
+         
+    if prev_candle['close'] < c1_low and curr_candle['high'] >= c1_low and curr_candle['close'] < c1_low and curr_candle['close'] < curr_candle['open']:
+         m2_sell = (recent_bear_fvg or has_bear_ob)
+
+    # --- CONFLUENCE SCORE ---
+    bull_score = 0
+    if curr_candle['low'] < c1_low: bull_score += 1
+    if recent_bull_fvg: bull_score += 1
+    if has_bull_ob: bull_score += 1
+    if current_close < c1_eq: bull_score += 1 
+    if m1_buy or m2_buy: bull_score += 1
+
+    bear_score = 0
+    if curr_candle['high'] > c1_high: bear_score += 1
+    if recent_bear_fvg: bear_score += 1
+    if has_bear_ob: bear_score += 1
+    if current_close > c1_eq: bear_score += 1 
+    if m1_sell or m2_sell: bear_score += 1
+
+    signal = None
+    if m1_buy:
+        signal = {"dir": "BULLISH", "model": "Model 1 (15m Sweep)", "score": bull_score, "eq": c1_eq}
+    elif m1_sell:
+        signal = {"dir": "BEARISH", "model": "Model 1 (15m Sweep)", "score": bear_score, "eq": c1_eq}
+    elif m2_buy:
+        signal = {"dir": "BULLISH", "model": "Model 2 (15m MSS)", "score": bull_score, "eq": c1_eq}
+    elif m2_sell:
+        signal = {"dir": "BEARISH", "model": "Model 2 (15m MSS)", "score": bear_score, "eq": c1_eq}
+
+    return signal
+
+# ===== 5. ASYNC SCANNER & TELEGRAM =====
+async def send_telegram_message(msg):
+    if not TG_TOKEN:
+        print("ERROR: TG_TOKEN is missing!")
+        return
+    bot = Bot(token=TG_TOKEN)
+    
+    for attempt in range(3):
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            print("--> Message successfully sent to Telegram!")
+            return
+        except Exception as e:
+            print(f"Telegram attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(3)
+            else:
+                print("--> Failed to send message after 3 attempts.")
+
+async def run_scan():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting CRT Master scan (15m Entry)...")
+    alerts = []
+
+    for symbol, name in INSTRUMENTS.items():
+        print(f"Scanning {name}...")
+        
+        # Fetch 4H data (for CRT range)
+        df_4h = fetch_ohlc(symbol, TIMEFRAME, "60d")
+        # Fetch 15m data (for entry confirmation - only 5 days needed)
+        df_15m = fetch_ohlc(symbol, ENTRY_TF, "5d")
+        
+        if df_4h is None or df_15m is None:
+            continue
+            
+        signal = check_crt_signals(df_4h, df_15m)
+        
+        if signal:
+            if signal['score'] >= 3:
+                alerts.append({
+                    "instrument": name,
+                    "direction": signal['dir'],
+                    "model": signal['model'],
+                    "score": signal['score'],
+                    "price": df_15m.iloc[-1]['close'],
+                    "eq": signal['eq']
+                })
+
+    if alerts:
+        msg = "🚨 *CRT MASTER SIGNAL* 🚨\n\n"
+        for a in alerts:
+            msg += (
+                f"*{a['instrument']}* | {a['direction']}\n"
+                f"Price: `{a['price']:.4f}` | EQ: `{a['eq']:.4f}`\n"
+                f"Confluence Score: *{a['score']}/5*\n"
+                f"Trigger: {a['model']}\n\n"
+            )
+        await send_telegram_message(msg)
+        print(f"--> Found {len(alerts)} signal(s). Sent to Telegram!")
+    else:
+        msg = (
+            "🔍 *CRT Master Scanner Update (15m Entry)*\n\n"
+            "No valid high-confluence signals detected.\n\n"
+            f"*Scanned:* US30, Nasdaq, Gold, US500, USDJPY, USDCAD, GBPUSD, EURUSD, BTCUSD, ETHUSD, UK100\n"
+            f"*Time:* {datetime.now().strftime('%H:%M')} UTC\n\n"
+            "Waiting for the next 15m candle close."
+        )
+        await send_telegram_message(msg)
+        print("--> No signals found. Heartbeat message processed.")
+
+# ===== 6. EXECUTION =====
+if __name__ == "__main__":
+    print("🤖 Running scheduled CRT Master scan...")
+    asyncio.run(run_scan())
+    print("Scan complete. Exiting.")
